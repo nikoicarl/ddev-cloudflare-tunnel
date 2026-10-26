@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# ddev-tunnel: share a local DDEV site through a Cloudflare quick tunnel.
+#
+# Usage: ddev-tunnel [project-dir]   start a tunnel
+#        ddev-tunnel stop            stop all quick tunnels
+#        ddev-tunnel status          list running quick tunnels
+#        ddev-tunnel help            show this help
+#
+# project-dir defaults to the DDEV project containing the current directory.
+# The trycloudflare.com URL is random and changes on every run.
+# Anyone with the link can reach the site. Press Ctrl+C to stop.
+
+set -euo pipefail
+
+usage() {
+  sed -n '4,11p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# Matches only quick tunnels (started with --url), not named tunnels.
+tunnel_pattern='cloudflared tunnel .*--url'
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+  stop)
+    if ! pgrep -f "$tunnel_pattern" >/dev/null; then
+      echo "No tunnels running."
+      exit 0
+    fi
+    pkill -f "$tunnel_pattern" || true
+    # cloudflared takes a few seconds to close its connections.
+    for _ in {1..10}; do
+      pgrep -f "$tunnel_pattern" >/dev/null || { echo "Tunnel stopped."; exit 0; }
+      sleep 1
+    done
+    pkill -9 -f "$tunnel_pattern" || true
+    echo "Tunnel force-stopped."
+    exit 0
+    ;;
+  status)
+    pgrep -af "$tunnel_pattern" || echo "No tunnels running."
+    exit 0
+    ;;
+esac
+
+# Find the DDEV project: the given directory, or the nearest parent of the
+# current directory that has .ddev/config.yaml (~/.ddev alone is DDEV's
+# global config, not a project).
+find_project() {
+  local dir
+  dir=$(cd "$1" 2>/dev/null && pwd) || return 1
+  while [[ "$dir" != "/" ]]; do
+    [[ -f "$dir/.ddev/config.yaml" ]] && { echo "$dir"; return 0; }
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
+start_dir="${1:-$PWD}"
+[[ -d "$start_dir" ]] || { echo "No such directory: $start_dir" >&2; exit 1; }
+project_dir=$(find_project "$start_dir") || {
+  echo "Not inside a DDEV project: $start_dir" >&2
+  echo "Run this from a DDEV project, or pass its path: ddev-tunnel ~/sites/mysite" >&2
+  exit 1
+}
+cd "$project_dir"
+
+for cmd in ddev cloudflared python3; do
+  command -v "$cmd" >/dev/null || { echo "$cmd is not installed." >&2; exit 1; }
+done
+
+# Read one value from `ddev describe -j`; prints nothing if it is missing.
+ddev_value() {
+  ddev describe -j 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)["raw"]
+    for key in sys.argv[1:]:
+        d = d[key]
+    print(d)
+except Exception:
+    pass
+' "$@"
+}
+
+# Start DDEV if the project is not running.
+if [[ "$(ddev_value status)" != "running" ]]; then
+  echo "Starting DDEV in $project_dir..."
+  ddev start
+fi
+
+# The web container's direct port changes between restarts, so look it up.
+# Tunnelling to it (rather than the DDEV router) avoids host-name routing.
+web_url=$(ddev_value services web host_http_url)
+[[ -n "$web_url" ]] || { echo "Could not find the DDEV web port (is the project running?)." >&2; exit 1; }
+
+project_name=$(basename "$project_dir")
+log_file="${TMPDIR:-/tmp}/ddev-tunnel-$project_name.log"
+
+# Copy to the clipboard with whatever tool this system has.
+copy_to_clipboard() {
+  local tool
+  for tool in clip.exe pbcopy wl-copy "xclip -selection clipboard" "xsel --clipboard --input"; do
+    if command -v "${tool%% *}" >/dev/null; then
+      printf '%s' "$1" | $tool 2>/dev/null && return 0
+    fi
+  done
+  return 1
+}
+
+echo "Tunnelling $project_name ($web_url)..."
+echo "Waiting for Cloudflare (log: $log_file)"
+
+# Keep cloudflared's log out of the terminal so the URL stays visible;
+# show only the URL box, plus any errors.
+cloudflared tunnel --no-autoupdate --url "$web_url" 2>&1 | tee "$log_file" | while IFS= read -r line; do
+  # The public URL is printed inside a box ("|  https://...  |"). Matching
+  # the box avoids picking up api.trycloudflare.com from error messages.
+  if [[ "$line" =~ \|[[:space:]]+(https://[a-z0-9-]+\.trycloudflare\.com) ]]; then
+    url="${BASH_REMATCH[1]}"
+    echo
+    echo "=================================================="
+    echo "  Public URL: $url"
+    if copy_to_clipboard "$url"; then
+      echo "  (copied to clipboard)"
+    fi
+    echo "  Press Ctrl+C to stop."
+    echo "=================================================="
+    echo
+  elif [[ "$line" == *" ERR "* ]]; then
+    echo "$line"
+  fi
+done
